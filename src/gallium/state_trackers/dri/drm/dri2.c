@@ -498,6 +498,219 @@ dri2_release_buffer(__DRIscreen *sPriv, __DRIbuffer *bPriv)
    FREE(buffer);
 }
 
+static void
+dri_image_allocate_textures(struct dri_context *ctx,
+                       struct dri_drawable *drawable,
+                       const enum st_attachment_type *statts,
+                       unsigned statts_count)
+{
+   __DRIdrawable *dPriv = drawable->dPriv;
+   __DRIscreen *sPriv = drawable->sPriv;
+   struct dri_screen *screen = dri_screen(sPriv);
+   unsigned int image_format = __DRI_IMAGE_FORMAT_NONE;
+   uint32_t buffer_mask = 0;
+   struct __DRIimageList images;
+   boolean alloc_depthstencil = FALSE;
+   int i, j;
+   struct pipe_resource templ;
+
+   /* See if we need a depth-stencil buffer. */
+   for (i = 0; i < statts_count; i++) {
+      if (statts[i] == ST_ATTACHMENT_DEPTH_STENCIL) {
+         alloc_depthstencil = TRUE;
+         break;
+      }
+   }
+
+   /* Delete the resources we won't need. */
+   for (i = 0; i < ST_ATTACHMENT_COUNT; i++) {
+      /* Don't delete the depth-stencil buffer, we can reuse it. */
+      if (i == ST_ATTACHMENT_DEPTH_STENCIL && alloc_depthstencil)
+         continue;
+
+      pipe_resource_reference(&drawable->textures[i], NULL);
+   }
+
+   if (drawable->stvis.samples > 1) {
+      for (i = 0; i < ST_ATTACHMENT_COUNT; i++) {
+         boolean del = TRUE;
+
+         /* Don't delete MSAA resources for the attachments which are enabled,
+          * we can reuse them. */
+         for (j = 0; j < statts_count; j++) {
+            if (i == statts[j]) {
+               del = FALSE;
+               break;
+            }
+         }
+
+         if (del) {
+            pipe_resource_reference(&drawable->msaa_textures[i], NULL);
+         }
+      }
+   }
+
+   for (i = 0; i < statts_count; i++) {
+      enum pipe_format pf;
+      unsigned bind;
+
+      dri_drawable_get_format(drawable, statts[i], &pf, &bind);
+      if (pf == PIPE_FORMAT_NONE)
+         continue;
+
+      switch (pf) {
+      case PIPE_FORMAT_B5G6R5_UNORM:
+         image_format = __DRI_IMAGE_FORMAT_RGB565;
+         break;
+      case PIPE_FORMAT_B8G8R8X8_UNORM:
+         image_format = __DRI_IMAGE_FORMAT_XRGB8888;
+         break;
+      case PIPE_FORMAT_B8G8R8A8_UNORM:
+         image_format = __DRI_IMAGE_FORMAT_ARGB8888;
+         break;
+      case PIPE_FORMAT_R8G8B8A8_UNORM:
+         image_format = __DRI_IMAGE_FORMAT_ABGR8888;
+         break;
+      default:
+         image_format = __DRI_IMAGE_FORMAT_NONE;
+         break;
+      }
+
+      switch (statts[i]) {
+      case ST_ATTACHMENT_FRONT_LEFT:
+         buffer_mask |= __DRI_IMAGE_BUFFER_FRONT;
+         break;
+      case ST_ATTACHMENT_BACK_LEFT:
+         buffer_mask |= __DRI_IMAGE_BUFFER_BACK;
+         break;
+      default:
+         continue;
+      }
+   }
+
+   (*sPriv->image.loader->getBuffers) (dPriv,
+                                       image_format,
+                                       &dPriv->dri2.stamp,
+                                       dPriv->loaderPrivate,
+                                       buffer_mask,
+                                       &images);
+
+   if (images.image_mask & __DRI_IMAGE_BUFFER_FRONT) {
+      struct pipe_resource *texture = images.front->texture;
+
+      dPriv->w = texture->width0;
+      dPriv->h = texture->height0;
+
+      pipe_resource_reference(&drawable->textures[ST_ATTACHMENT_FRONT_LEFT], texture);
+   }
+
+   if (images.image_mask & __DRI_IMAGE_BUFFER_BACK) {
+      struct pipe_resource *texture = images.back->texture;
+
+      dPriv->w = images.back->texture->width0;
+      dPriv->h = images.back->texture->height0;
+
+      pipe_resource_reference(&drawable->textures[ST_ATTACHMENT_BACK_LEFT], texture);
+   }
+
+   memset(&templ, 0, sizeof(templ));
+   templ.target = screen->target;
+   templ.last_level = 0;
+   templ.width0 = dPriv->w;
+   templ.height0 = dPriv->h;
+   templ.depth0 = 1;
+   templ.array_size = 1;
+
+   /* Allocate private MSAA colorbuffers. */
+   if (drawable->stvis.samples > 1) {
+      for (i = 0; i < statts_count; i++) {
+         enum st_attachment_type att = statts[i];
+
+         if (att == ST_ATTACHMENT_DEPTH_STENCIL)
+            continue;
+
+         if (drawable->textures[att]) {
+            templ.format = drawable->textures[att]->format;
+            templ.bind = drawable->textures[att]->bind;
+            templ.nr_samples = drawable->stvis.samples;
+
+            /* Try to reuse the resource.
+             * (the other resource parameters should be constant)
+             */
+            if (!drawable->msaa_textures[att] ||
+                drawable->msaa_textures[att]->width0 != templ.width0 ||
+                drawable->msaa_textures[att]->height0 != templ.height0) {
+               /* Allocate a new one. */
+               pipe_resource_reference(&drawable->msaa_textures[att], NULL);
+
+               drawable->msaa_textures[att] =
+                  screen->base.screen->resource_create(screen->base.screen,
+                                                       &templ);
+               assert(drawable->msaa_textures[att]);
+
+               /* If there are any MSAA resources, we should initialize them
+                * such that they contain the same data as the single-sample
+                * resources we just got from the X server.
+                *
+                * The reason for this is that the state tracker (and
+                * therefore the app) can access the MSAA resources only.
+                * The single-sample resources are not exposed
+                * to the state tracker.
+                *
+                */
+               dri_pipe_blit(ctx->st->pipe,
+                             drawable->msaa_textures[att],
+                             drawable->textures[att]);
+            }
+         }
+         else {
+            pipe_resource_reference(&drawable->msaa_textures[att], NULL);
+         }
+      }
+   }
+
+   /* Allocate a private depth-stencil buffer. */
+   if (alloc_depthstencil) {
+      enum st_attachment_type att = ST_ATTACHMENT_DEPTH_STENCIL;
+      struct pipe_resource **zsbuf;
+      enum pipe_format format;
+      unsigned bind;
+
+      dri_drawable_get_format(drawable, att, &format, &bind);
+
+      if (format) {
+         templ.format = format;
+         templ.bind = bind;
+
+         if (drawable->stvis.samples > 1) {
+            templ.nr_samples = drawable->stvis.samples;
+            zsbuf = &drawable->msaa_textures[att];
+         }
+         else {
+            templ.nr_samples = 0;
+            zsbuf = &drawable->textures[att];
+         }
+
+         /* Try to reuse the resource.
+          * (the other resource parameters should be constant)
+          */
+         if (!*zsbuf ||
+             (*zsbuf)->width0 != templ.width0 ||
+             (*zsbuf)->height0 != templ.height0) {
+            /* Allocate a new one. */
+            pipe_resource_reference(zsbuf, NULL);
+            *zsbuf = screen->base.screen->resource_create(screen->base.screen,
+                                                          &templ);
+            assert(*zsbuf);
+         }
+      }
+      else {
+         pipe_resource_reference(&drawable->msaa_textures[att], NULL);
+         pipe_resource_reference(&drawable->textures[att], NULL);
+      }
+   }
+}
+
 /*
  * Backend functions for st_framebuffer interface.
  */
@@ -508,13 +721,18 @@ dri2_allocate_textures(struct dri_context *ctx,
                        const enum st_attachment_type *statts,
                        unsigned statts_count)
 {
-   __DRIbuffer *buffers;
-   unsigned num_buffers = statts_count;
+   __DRIscreen *sPriv = drawable->sPriv;
 
-   buffers = dri2_drawable_get_buffers(drawable, statts, &num_buffers);
-   if (buffers)
-      dri2_drawable_process_buffers(ctx, drawable, buffers, num_buffers,
-                                    statts, statts_count);
+   if (sPriv->image.loader) {
+      dri_image_allocate_textures(ctx, drawable, statts, statts_count);
+   } else {
+      __DRIbuffer *buffers;
+      unsigned num_buffers = statts_count;
+      buffers = dri2_drawable_get_buffers(drawable, statts, &num_buffers);
+      if (buffers)
+         dri2_drawable_process_buffers(ctx, drawable, buffers, num_buffers,
+                                       statts, statts_count);
+   }
 }
 
 static void
@@ -523,6 +741,7 @@ dri2_flush_frontbuffer(struct dri_context *ctx,
                        enum st_attachment_type statt)
 {
    __DRIdrawable *dri_drawable = drawable->dPriv;
+   const __DRIimageLoaderExtension *image = drawable->sPriv->image.loader;
    const __DRIdri2LoaderExtension *loader = drawable->sPriv->dri2.loader;
    struct pipe_context *pipe = ctx->st->pipe;
 
@@ -542,7 +761,9 @@ dri2_flush_frontbuffer(struct dri_context *ctx,
 
    pipe->flush(pipe, NULL, 0);
 
-   if (loader->flushFrontBuffer) {
+   if (image->flushFrontBuffer) {
+      image->flushFrontBuffer(dri_drawable, dri_drawable->loaderPrivate);
+   } else if (loader->flushFrontBuffer) {
       loader->flushFrontBuffer(dri_drawable, dri_drawable->loaderPrivate);
    }
 }
@@ -1171,6 +1392,7 @@ const struct __DriverAPIRec driDriverAPI = {
 /* This is the table of extensions that the loader will dlsym() for. */
 PUBLIC const __DRIextension *__driDriverExtensions[] = {
     &driCoreExtension.base,
+    &driImageDriverExtension.base,
     &driDRI2Extension.base,
     &gallium_config_options.base,
     NULL
