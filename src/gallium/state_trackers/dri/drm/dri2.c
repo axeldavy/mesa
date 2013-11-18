@@ -549,6 +549,17 @@ dri_image_allocate_textures(struct dri_context *ctx,
       if (pf == PIPE_FORMAT_NONE)
          continue;
 
+      switch (statts[i]) {
+      case ST_ATTACHMENT_FRONT_LEFT:
+         buffer_mask |= __DRI_IMAGE_BUFFER_FRONT;
+         break;
+      case ST_ATTACHMENT_BACK_LEFT:
+         buffer_mask |= __DRI_IMAGE_BUFFER_BACK;
+         break;
+      default:
+         continue;
+      }
+
       switch (pf) {
       case PIPE_FORMAT_B5G6R5_UNORM:
          image_format = __DRI_IMAGE_FORMAT_RGB565;
@@ -565,17 +576,6 @@ dri_image_allocate_textures(struct dri_context *ctx,
       default:
          image_format = __DRI_IMAGE_FORMAT_NONE;
          break;
-      }
-
-      switch (statts[i]) {
-      case ST_ATTACHMENT_FRONT_LEFT:
-         buffer_mask |= __DRI_IMAGE_BUFFER_FRONT;
-         break;
-      case ST_ATTACHMENT_BACK_LEFT:
-         buffer_mask |= __DRI_IMAGE_BUFFER_BACK;
-         break;
-      default:
-         continue;
       }
    }
 
