@@ -581,7 +581,7 @@ dri_image_allocate_textures(struct dri_context *ctx,
 
    (*sPriv->image.loader->getBuffers) (dPriv,
                                        image_format,
-                                       &dPriv->dri2.stamp,
+                                       (uint32_t *) &drawable->base.stamp,
                                        dPriv->loaderPrivate,
                                        buffer_mask,
                                        &images);
