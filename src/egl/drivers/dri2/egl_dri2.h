@@ -133,6 +133,7 @@ struct dri2_egl_display
    int			     authenticated;
    int			     formats;
    uint32_t                  capabilities;
+   int			     enable_tiling;
 #endif
 
    int (*authenticate) (_EGLDisplay *disp, uint32_t id);

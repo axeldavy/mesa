@@ -41,6 +41,10 @@
 #include <wayland-client.h>
 #include "wayland-drm-client-protocol.h"
 
+#ifdef HAVE_LIBUDEV
+#include <libudev.h>
+#endif
+
 enum wl_drm_format_flags {
    HAS_ARGB8888 = 1,
    HAS_XRGB8888 = 2,
@@ -297,12 +301,17 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
    if (dri2_surf->back == NULL)
       return -1;
    if (dri2_surf->back->dri_image == NULL) {
+      unsigned int use_flags = __DRI_IMAGE_USE_SHARE;
+
+      if (!dri2_dpy->enable_tiling)
+         use_flags |= __DRI_IMAGE_USE_LINEAR;
+
       dri2_surf->back->dri_image = 
          dri2_dpy->image->createImage(dri2_dpy->dri_screen,
                                       dri2_surf->base.Width,
                                       dri2_surf->base.Height,
                                       __DRI_IMAGE_FORMAT_ARGB8888,
-                                      __DRI_IMAGE_USE_SHARE,
+                                      use_flags,
                                       NULL);
       dri2_surf->back->age = 0;
    }
@@ -692,6 +701,13 @@ dri2_create_wayland_buffer_from_image_wl(_EGLDriver *drv,
    int width, height, format, pitch;
    enum wl_drm_format wl_format;
 
+   /* The buffer to import likely has tiling. We can't check for it,
+    * so assume we cannot import.*/
+   if (!dri2_dpy->enable_tiling) {
+      _eglError(EGL_BAD_MATCH, "dri2_create_wayland_buffer_from_image_wl");
+      return NULL;
+   }
+
    dri2_dpy->image->queryImage(image, __DRI_IMAGE_ATTRIB_FORMAT, &format);
 
    switch (format) {
@@ -801,34 +817,127 @@ dri2_terminate(_EGLDriver *drv, _EGLDisplay *disp)
    return EGL_TRUE;
 }
 
+static char
+is_fd_render_node(int fd)
+{
+   struct stat render;
+
+   if (fstat(fd, &render))
+      return 0;
+
+   if (!S_ISCHR(render.st_mode))
+      return 0;
+
+   if (render.st_rdev & 0x80)
+      return 1;
+   return 0;
+}
+
+#ifdef HAVE_LIBUDEV
+
+static char *
+get_render_node_from_id_path_tag(struct udev *udev,
+				 char *id_path_tag,
+				 char another_tag)
+{
+   struct udev_device *device;
+   struct udev_enumerate *e;
+   struct udev_list_entry *entry;
+   const char *path, *id_path_tag_tmp;
+   char *path_res;
+   char found = 0;
+
+   e = udev_enumerate_new(udev);
+   udev_enumerate_add_match_subsystem(e, "drm");
+   udev_enumerate_add_match_sysname(e, "render*");
+
+   udev_enumerate_scan_devices(e);
+   udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
+      path = udev_list_entry_get_name(entry);
+      device = udev_device_new_from_syspath(udev, path);
+      if (!device)
+         continue;
+      id_path_tag_tmp = udev_device_get_property_value(device, "ID_PATH_TAG");
+      if (id_path_tag_tmp) {
+         if ((!another_tag && !strcmp(id_path_tag, id_path_tag_tmp)) ||
+             (another_tag && strcmp(id_path_tag, id_path_tag_tmp))) {
+            found = 1;
+            break;
+         }
+      }
+      udev_device_unref(device);
+   }
+
+   if (found) {
+      path_res = strdup(udev_device_get_devnode(device));
+      udev_device_unref(device);
+      return path_res;
+   }
+   return NULL;
+}
+
+static char *
+get_id_path_tag_from_fd(struct udev *udev, int fd)
+{
+   struct udev_device *device;
+   struct stat buf;
+   const char *id_path_tag_tmp;
+
+   if (fstat(fd, &buf) < 0) {
+      return NULL;
+   }
+
+   device = udev_device_new_from_devnum(udev, 'c', buf.st_rdev);
+   if (!device)
+      return NULL;
+
+   id_path_tag_tmp = udev_device_get_property_value(device, "ID_PATH_TAG");
+   if (!id_path_tag_tmp)
+      return NULL;
+
+   return strdup(id_path_tag_tmp);
+}
+#endif
+
+static EGLBoolean
+is_render_node_capable(struct dri2_egl_display *dri2_dpy)
+{
+   const __DRIextension **extensions;
+   int i;
+
+   if (!(dri2_dpy->capabilities & WL_DRM_CAPABILITY_PRIME))
+      return EGL_FALSE;
+
+   extensions = dri2_dpy->driver_extensions;
+   for (i = 0; extensions[i]; i++) {
+      if (strcmp(extensions[i]->name, __DRI_IMAGE_DRIVER) == 0)
+         return EGL_TRUE;
+   }
+   return EGL_FALSE;
+}
+
+static int
+drm_open_device(const char *device_name)
+{
+   int fd;
+#ifdef O_CLOEXEC
+   fd = open(device_name, O_RDWR | O_CLOEXEC);
+   if (fd == -1 && errno == EINVAL)
+#endif
+   {
+      fd = open(device_name, O_RDWR);
+      if (fd != -1)
+         fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+   }
+   return fd;
+}
+
 static void
 drm_handle_device(void *data, struct wl_drm *drm, const char *device)
 {
    struct dri2_egl_display *dri2_dpy = data;
-   drm_magic_t magic;
 
    dri2_dpy->device_name = strdup(device);
-   if (!dri2_dpy->device_name)
-      return;
-
-#ifdef O_CLOEXEC
-   dri2_dpy->fd = open(dri2_dpy->device_name, O_RDWR | O_CLOEXEC);
-   if (dri2_dpy->fd == -1 && errno == EINVAL)
-#endif
-   {
-      dri2_dpy->fd = open(dri2_dpy->device_name, O_RDWR);
-      if (dri2_dpy->fd != -1)
-         fcntl(dri2_dpy->fd, F_SETFD, fcntl(dri2_dpy->fd, F_GETFD) |
-            FD_CLOEXEC);
-   }
-   if (dri2_dpy->fd == -1) {
-      _eglLog(_EGL_WARNING, "wayland-egl: could not open %s (%s)",
-	      dri2_dpy->device_name, strerror(errno));
-      return;
-   }
-
-   drmGetMagic(dri2_dpy->fd, &magic);
-   wl_drm_authenticate(dri2_dpy->wl_drm, magic);
 }
 
 static void
@@ -958,12 +1067,19 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    struct dri2_egl_display *dri2_dpy;
    const __DRIconfig *config;
    uint32_t types;
-   int i;
+   int i, is_render_node, device_fd, is_different_device;
+   drm_magic_t magic;
    static const unsigned int argb_masks[4] =
       { 0xff0000, 0xff00, 0xff, 0xff000000 };
    static const unsigned int rgb_masks[4] = { 0xff0000, 0xff00, 0xff, 0 };
    static const unsigned int rgb565_masks[4] = { 0xf800, 0x07e0, 0x001f, 0 };
 
+   char *prime_device_name = NULL;
+   char *prime = NULL;
+   const char *dri_prime = getenv("DRI_PRIME");
+
+   if (dri_prime)
+      prime = strdup(dri_prime);
    loader_set_logger(_eglLog);
 
    drv->API.CreateWindowSurface = dri2_create_window_surface;
@@ -1004,8 +1120,90 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    if (roundtrip(dri2_dpy) < 0 || dri2_dpy->wl_drm == NULL)
       goto cleanup_dpy;
 
-   if (roundtrip(dri2_dpy) < 0 || dri2_dpy->fd == -1)
+   if (roundtrip(dri2_dpy) < 0 || dri2_dpy->device_name == NULL)
       goto cleanup_drm;
+
+   if (prime && !(dri2_dpy->capabilities & WL_DRM_CAPABILITY_PRIME)) {
+   /* render-nodes are not supported */
+      free(prime);
+      prime = NULL;
+   }
+
+   device_fd = drm_open_device(dri2_dpy->device_name);
+   if (device_fd == -1) {
+      _eglLog(_EGL_WARNING, "wayland-egl: could not open %s (%s)",
+	      dri2_dpy->device_name, strerror(errno));
+      free(prime);
+      goto cleanup_drm;
+   }
+
+   if (prime != NULL) {
+#ifdef HAVE_LIBUDEV
+      struct udev* udev = udev_new();
+      char *device_id_path_tag;
+      char another_tag = 0;
+
+      if (!udev)
+         goto prime_clean;
+      device_id_path_tag = get_id_path_tag_from_fd(udev, device_fd);
+      if (!device_id_path_tag)
+         goto udev_clean;
+
+      is_different_device = 1;
+      /* two format are supported:
+       * "1": choose any other card than the card used by the compositor.
+       * id_path_tag: (for example "pci-0000_02_00_0") choose the card
+       * with this id_path_tag. */
+      if (!strcmp(prime,"1")) {
+         free(prime);
+         prime = strdup(device_id_path_tag);
+         /* request a card with a different card than the compositor card */
+         another_tag = 1;
+      } else if (!strcmp(device_id_path_tag, prime))
+         /* we want to get the render-node of the compositor card */
+         is_different_device = 0;
+
+      prime_device_name = get_render_node_from_id_path_tag(udev, prime,
+                                                           another_tag);
+      if (prime_device_name)
+         _eglLog(_EGL_DEBUG,"requested device found: %s",
+                  prime_device_name);
+      else
+         _eglLog(_EGL_WARNING,"requested device not found.");
+      free(device_id_path_tag);
+    udev_clean:
+      udev_unref(udev);
+    prime_clean:
+#endif
+      free(prime);
+   }
+
+   if (prime_device_name != NULL) {
+      close(device_fd);
+      free(dri2_dpy->device_name);
+      dri2_dpy->device_name = prime_device_name;
+      dri2_dpy->fd = drm_open_device(dri2_dpy->device_name);
+
+      if (dri2_dpy->fd == -1) {
+         _eglLog(_EGL_WARNING, "wayland-egl: could not open %s (%s)",
+                 dri2_dpy->device_name, strerror(errno));
+         goto cleanup_drm;
+      }
+   } else {
+      is_different_device = 0;
+      dri2_dpy->fd = device_fd;
+   }
+
+   if (is_fd_render_node(dri2_dpy->fd)) {
+      _eglLog(_EGL_DEBUG, "wayland-egl: card is render-node");
+      dri2_dpy->authenticated = 1;
+      is_render_node = 1;
+   } else {
+      drmGetMagic(dri2_dpy->fd, &magic);
+      wl_drm_authenticate(dri2_dpy->wl_drm, magic);
+      is_render_node = 0;
+   }
+   dri2_dpy->enable_tiling = !is_different_device;
 
    if (roundtrip(dri2_dpy) < 0 || !dri2_dpy->authenticated)
       goto cleanup_fd;
@@ -1039,14 +1237,19 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
 
    dri2_setup_swap_interval(dri2_dpy);
 
-   /* The server shouldn't advertise WL_DRM_CAPABILITY_PRIME if the driver
-    * doesn't have createImageFromFds, since we're using the same driver on
-    * both sides.  We don't want crash if that happens anyway, so fall back to
-    * gem names if we don't have prime support. */
+   /* To use Prime, we must have _DRI_IMAGE v7 at least.
+    * createImageFromFds support indicates that Prime export/import
+    * is supported by the driver. Fall back to
+    * gem names if we don't have Prime support. */
 
    if (dri2_dpy->image->base.version < 7 ||
        dri2_dpy->image->createImageFromFds == NULL)
       dri2_dpy->capabilities &= ~WL_DRM_CAPABILITY_PRIME;
+
+   if (is_render_node && !is_render_node_capable(dri2_dpy)) {
+      _eglLog(_EGL_WARNING, "wayland-egl: display is not render-node capable");
+      goto cleanup_screen;
+   }
 
    types = EGL_WINDOW_BIT;
    for (i = 0; dri2_dpy->driver_configs[i]; i++) {
@@ -1071,7 +1274,8 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    disp->VersionMinor = 4;
 
    return EGL_TRUE;
-
+ cleanup_screen:
+   dri2_dpy->core->destroyScreen(dri2_dpy->dri_screen);
  cleanup_driver:
    dlclose(dri2_dpy->driver);
  cleanup_driver_name:
