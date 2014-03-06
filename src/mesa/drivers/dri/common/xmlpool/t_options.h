@@ -326,3 +326,8 @@ DRI_CONF_OPT_END
 DRI_CONF_OPT_BEGIN(wanted_device_id_path_tag, string, def) \
         DRI_CONF_DESC(en,gettext("Define the graphic device to use if possible")) \
 DRI_CONF_OPT_END
+
+#define DRI_CONF_BLIT_IF_DIFFERENT_DEVICE(def) \
+DRI_CONF_OPT_BEGIN_B(blit_if_different_device, def) \
+        DRI_CONF_DESC(en,gettext("Render to a separate buffer and copy to a shared buffer. Apply only if using a different device than the server")) \
+DRI_CONF_OPT_END

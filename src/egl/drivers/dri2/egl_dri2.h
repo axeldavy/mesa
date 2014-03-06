@@ -134,6 +134,7 @@ struct dri2_egl_display
    int			     formats;
    uint32_t                  capabilities;
    int			     enable_tiling;
+   int			     blit_front;
 #endif
 
    int (*authenticate) (_EGLDisplay *disp, uint32_t id);
@@ -189,6 +190,7 @@ struct dri2_egl_surface
 #ifdef HAVE_WAYLAND_PLATFORM
       struct wl_buffer   *wl_buffer;
       __DRIimage         *dri_image;
+      __DRIimage         *front_image;
 #endif
 #ifdef HAVE_DRM_PLATFORM
       struct gbm_bo       *bo;

@@ -53,6 +53,7 @@ PUBLIC const char __driConfigOptionsWayland[] =
 DRI_CONF_BEGIN
     DRI_CONF_SECTION_MISCELLANEOUS
         DRI_CONF_WANTED_DEVICE_ID_PATH_TAG()
+        DRI_CONF_BLIT_IF_DIFFERENT_DEVICE("true")
     DRI_CONF_SECTION_END
 DRI_CONF_END;
 
@@ -231,8 +232,12 @@ dri2_destroy_surface(_EGLDriver *drv, _EGLDisplay *disp, _EGLSurface *surf)
    for (i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
       if (dri2_surf->color_buffers[i].wl_buffer)
          wl_buffer_destroy(dri2_surf->color_buffers[i].wl_buffer);
-      if (dri2_surf->color_buffers[i].dri_image)
+      if (dri2_surf->color_buffers[i].dri_image) {
          dri2_dpy->image->destroyImage(dri2_surf->color_buffers[i].dri_image);
+         if (dri2_dpy->blit_front)
+            dri2_dpy->image->destroyImage
+               (dri2_surf->color_buffers[i].front_image);
+      }
    }
 
    for (i = 0; i < __DRI_BUFFER_COUNT; i++)
@@ -265,11 +270,16 @@ dri2_release_buffers(struct dri2_egl_surface *dri2_surf)
       if (dri2_surf->color_buffers[i].wl_buffer &&
           !dri2_surf->color_buffers[i].locked)
          wl_buffer_destroy(dri2_surf->color_buffers[i].wl_buffer);
-      if (dri2_surf->color_buffers[i].dri_image)
+      if (dri2_surf->color_buffers[i].dri_image) {
          dri2_dpy->image->destroyImage(dri2_surf->color_buffers[i].dri_image);
+         if (dri2_dpy->blit_front)
+            dri2_dpy->image->destroyImage
+               (dri2_surf->color_buffers[i].front_image);
+      }
 
       dri2_surf->color_buffers[i].wl_buffer = NULL;
       dri2_surf->color_buffers[i].dri_image = NULL;
+      dri2_surf->color_buffers[i].front_image = NULL;
       dri2_surf->color_buffers[i].locked = 0;
    }
 
@@ -317,13 +327,23 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
       if (!dri2_dpy->enable_tiling)
          use_flags |= __DRI_IMAGE_USE_LINEAR;
 
-      dri2_surf->back->dri_image = 
+      dri2_surf->back->front_image =
          dri2_dpy->image->createImage(dri2_dpy->dri_screen,
                                       dri2_surf->base.Width,
                                       dri2_surf->base.Height,
                                       __DRI_IMAGE_FORMAT_ARGB8888,
                                       use_flags,
                                       NULL);
+      if (dri2_dpy->blit_front)
+         dri2_surf->back->dri_image =
+            dri2_dpy->image->createImage(dri2_dpy->dri_screen,
+                                         dri2_surf->base.Width,
+                                         dri2_surf->base.Height,
+                                         __DRI_IMAGE_FORMAT_ARGB8888,
+                                         0,
+                                         NULL);
+      else
+         dri2_surf->back->dri_image = dri2_surf->back->front_image;
       dri2_surf->back->age = 0;
    }
    if (dri2_surf->back->dri_image == NULL)
@@ -410,8 +430,12 @@ update_buffers(struct dri2_egl_surface *dri2_surf)
           dri2_surf->color_buffers[i].wl_buffer) {
          wl_buffer_destroy(dri2_surf->color_buffers[i].wl_buffer);
          dri2_dpy->image->destroyImage(dri2_surf->color_buffers[i].dri_image);
+         if (dri2_dpy->blit_front)
+            dri2_dpy->image->destroyImage
+               (dri2_surf->color_buffers[i].front_image);
          dri2_surf->color_buffers[i].wl_buffer = NULL;
          dri2_surf->color_buffers[i].dri_image = NULL;
+         dri2_surf->color_buffers[i].front_image = NULL;
       }
    }
 
@@ -547,9 +571,9 @@ create_wl_buffer(struct dri2_egl_surface *dri2_surf)
       return;
 
    if (dri2_dpy->capabilities & WL_DRM_CAPABILITY_PRIME) {
-      dri2_dpy->image->queryImage(dri2_surf->current->dri_image,
+      dri2_dpy->image->queryImage(dri2_surf->current->front_image,
                                   __DRI_IMAGE_ATTRIB_FD, &fd);
-      dri2_dpy->image->queryImage(dri2_surf->current->dri_image,
+      dri2_dpy->image->queryImage(dri2_surf->current->front_image,
                                   __DRI_IMAGE_ATTRIB_STRIDE, &stride);
 
       dri2_surf->current->wl_buffer =
@@ -563,9 +587,9 @@ create_wl_buffer(struct dri2_egl_surface *dri2_surf)
                                     0, 0);
       close(fd);
    } else {
-      dri2_dpy->image->queryImage(dri2_surf->current->dri_image,
+      dri2_dpy->image->queryImage(dri2_surf->current->front_image,
                                   __DRI_IMAGE_ATTRIB_NAME, &name);
-      dri2_dpy->image->queryImage(dri2_surf->current->dri_image,
+      dri2_dpy->image->queryImage(dri2_surf->current->front_image,
                                   __DRI_IMAGE_ATTRIB_STRIDE, &stride);
 
       dri2_surf->current->wl_buffer =
@@ -648,9 +672,21 @@ dri2_swap_buffers_with_damage(_EGLDriver *drv,
       }
    }
 
-   if (dri2_dpy->flush->base.version >= 4) {
+   if (dri2_dpy->flush->base.version >= 4 || dri2_dpy->blit_front) {
       ctx = _eglGetCurrentContext();
       dri2_ctx = dri2_egl_context(ctx);
+   }
+
+   if (dri2_dpy->blit_front)
+      dri2_dpy->image->blitImage(dri2_ctx->dri_context,
+                                 dri2_surf->current->front_image,
+                                 dri2_surf->current->dri_image,
+                                 0, 0, dri2_surf->base.Width,
+                                 dri2_surf->base.Height,
+                                 0, 0, dri2_surf->base.Width,
+                                 dri2_surf->base.Height);
+
+   if (dri2_dpy->flush->base.version >= 4) {
       (*dri2_dpy->flush->flush_with_flags)(dri2_ctx->dri_context,
                                            dri2_surf->dri_drawable,
                                            __DRI2_FLUSH_DRAWABLE,
@@ -1078,7 +1114,7 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    struct dri2_egl_display *dri2_dpy;
    const __DRIconfig *config;
    uint32_t types;
-   int i, is_render_node, device_fd, is_different_device;
+   int i, is_render_node, device_fd, is_different_device, want_blit;
    drm_magic_t magic;
    static const unsigned int argb_masks[4] =
       { 0xff0000, 0xff00, 0xff, 0xff000000 };
@@ -1090,19 +1126,32 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    char *prime_device_name = NULL;
    char *prime = NULL;
    const char *dri_prime = getenv("DRI_PRIME");
+   const char *dri_blit = getenv("DRI_BLIT");
+
+   driParseOptionInfo(&defaultInitOptions, __driConfigOptionsWayland);
+   driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0, "init");
 
    if (dri_prime)
       prime = strdup(dri_prime);
    else {
-      driParseOptionInfo(&defaultInitOptions, __driConfigOptionsWayland);
-      driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0, "init");
       if (driCheckOption(&userInitOptions, "wanted_device_id_path_tag",
                          DRI_STRING))
          prime = strdup(driQueryOptionstr(&userInitOptions,
                                           "wanted_device_id_path_tag"));
-      driDestroyOptionCache(&userInitOptions);
-      driDestroyOptionInfo(&defaultInitOptions);
    }
+
+   errno = 0;
+   if (dri_blit)
+      want_blit = strtoul(dri_blit, NULL, 0);
+   if (errno || !dri_blit) {
+      if (driCheckOption(&userInitOptions,
+                         "blit_if_different_device",
+                         DRI_BOOL))
+         want_blit = driQueryOptionb(&userInitOptions, "blit_if_different_device");
+   }
+
+   driDestroyOptionCache(&userInitOptions);
+   driDestroyOptionInfo(&defaultInitOptions);
 
    loader_set_logger(_eglLog);
 
@@ -1273,6 +1322,12 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    if (is_render_node && !is_render_node_capable(dri2_dpy)) {
       _eglLog(_EGL_WARNING, "wayland-egl: display is not render-node capable");
       goto cleanup_screen;
+   }
+
+   if (is_different_device && dri2_dpy->image->base.version >= 9 &&
+                              want_blit) {
+      dri2_dpy->blit_front = 1;
+      _eglLog(_EGL_DEBUG, "wayland-egl: blit mode activated");
    }
 
    types = EGL_WINDOW_BIT;
