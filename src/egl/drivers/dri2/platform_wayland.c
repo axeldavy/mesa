@@ -45,6 +45,17 @@
 #include <libudev.h>
 #endif
 
+#include "xmlconfig.h"
+#include "xmlpool.h"
+
+
+PUBLIC const char __driConfigOptionsWayland[] =
+DRI_CONF_BEGIN
+    DRI_CONF_SECTION_MISCELLANEOUS
+        DRI_CONF_WANTED_DEVICE_ID_PATH_TAG()
+    DRI_CONF_SECTION_END
+DRI_CONF_END;
+
 enum wl_drm_format_flags {
    HAS_ARGB8888 = 1,
    HAS_XRGB8888 = 2,
@@ -1074,12 +1085,25 @@ dri2_initialize_wayland(_EGLDriver *drv, _EGLDisplay *disp)
    static const unsigned int rgb_masks[4] = { 0xff0000, 0xff00, 0xff, 0 };
    static const unsigned int rgb565_masks[4] = { 0xf800, 0x07e0, 0x001f, 0 };
 
+   driOptionCache defaultInitOptions;
+   driOptionCache userInitOptions;
    char *prime_device_name = NULL;
    char *prime = NULL;
    const char *dri_prime = getenv("DRI_PRIME");
 
    if (dri_prime)
       prime = strdup(dri_prime);
+   else {
+      driParseOptionInfo(&defaultInitOptions, __driConfigOptionsWayland);
+      driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0, "init");
+      if (driCheckOption(&userInitOptions, "wanted_device_id_path_tag",
+                         DRI_STRING))
+         prime = strdup(driQueryOptionstr(&userInitOptions,
+                                          "wanted_device_id_path_tag"));
+      driDestroyOptionCache(&userInitOptions);
+      driDestroyOptionInfo(&defaultInitOptions);
+   }
+
    loader_set_logger(_eglLog);
 
    drv->API.CreateWindowSurface = dri2_create_window_surface;

@@ -321,3 +321,8 @@ DRI_CONF_SECTION_BEGIN \
 DRI_CONF_OPT_BEGIN_B(always_have_depth_buffer, def) \
         DRI_CONF_DESC(en,gettext("Create all visuals with a depth buffer")) \
 DRI_CONF_OPT_END
+
+#define DRI_CONF_WANTED_DEVICE_ID_PATH_TAG(def) \
+DRI_CONF_OPT_BEGIN(wanted_device_id_path_tag, string, def) \
+        DRI_CONF_DESC(en,gettext("Define the graphic device to use if possible")) \
+DRI_CONF_OPT_END

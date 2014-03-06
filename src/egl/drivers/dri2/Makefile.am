@@ -53,10 +53,17 @@ AM_CFLAGS += $(XCB_DRI2_CFLAGS)
 endif
 
 if HAVE_EGL_PLATFORM_WAYLAND
-libegl_dri2_la_SOURCES += platform_wayland.c
+libegl_dri2_la_SOURCES += platform_wayland.c \
+			  $(top_srcdir)/src/mesa/drivers/dri/common/xmlconfig.c
 AM_CFLAGS += -DHAVE_WAYLAND_PLATFORM
-AM_CFLAGS += $(WAYLAND_CFLAGS) $(LIBUDEV_CFLAGS)
-libegl_dri2_la_LIBADD += $(LIBUDEV_LIBS)
+AM_CFLAGS += $(WAYLAND_CFLAGS) $(LIBUDEV_CFLAGS) \
+	     -I$(top_srcdir)/src/mesa/drivers/dri/common \
+             -I$(top_builddir)/src/mesa/drivers/dri/common \
+             -I$(top_builddir)/src/egl/wayland/wayland-drm \
+             -I$(top_builddir)/src/mesa \
+             -I$(top_builddir)/src/mapi
+
+libegl_dri2_la_LIBADD += $(LIBUDEV_LIBS) -lexpat
 endif
 
 if HAVE_EGL_PLATFORM_DRM
