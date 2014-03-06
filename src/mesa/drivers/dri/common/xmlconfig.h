@@ -30,9 +30,11 @@
 #ifndef __XMLCONFIG_H
 #define __XMLCONFIG_H
 
+#define STRING_CONF_MAXLEN 25
+
 /** \brief Option data types */
 typedef enum driOptionType {
-    DRI_BOOL, DRI_ENUM, DRI_INT, DRI_FLOAT
+    DRI_BOOL, DRI_ENUM, DRI_INT, DRI_FLOAT, DRI_STRING
 } driOptionType;
 
 /** \brief Option value */
@@ -40,6 +42,7 @@ typedef union driOptionValue {
     GLboolean _bool; /**< \brief Boolean */
     GLint _int;      /**< \brief Integer or Enum */
     GLfloat _float;  /**< \brief Floating-point */
+    char *_string;   /**< \brief String */
 } driOptionValue;
 
 /** \brief Single range of valid values
@@ -118,5 +121,7 @@ GLboolean driQueryOptionb (const driOptionCache *cache, const char *name);
 GLint driQueryOptioni (const driOptionCache *cache, const char *name);
 /** \brief Query a floating-point option value */
 GLfloat driQueryOptionf (const driOptionCache *cache, const char *name);
+/** \brief Query a string option value */
+char *driQueryOptionstr (const driOptionCache *cache, const char *name);
 
 #endif
