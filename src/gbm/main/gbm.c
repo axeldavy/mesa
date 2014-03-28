@@ -230,6 +230,13 @@ gbm_bo_get_handle(struct gbm_bo *bo)
    return bo->handle;
 }
 
+GBM_EXPORT int
+gbm_bo_get_fd(struct gbm_bo *bo)
+{
+   return bo->gbm->bo_get_fd(bo);
+}
+
+
 /** Write data into the buffer object
  *
  * If the buffer object was created with the GBM_BO_USE_WRITE flag,
