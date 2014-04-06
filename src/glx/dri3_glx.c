@@ -80,6 +80,73 @@
 #include "dri3_priv.h"
 #include "loader.h"
 
+#ifdef HAVE_LIBUDEV
+#include <libudev.h>
+
+static char *
+get_render_node_from_id_path_tag(struct udev *udev,
+                                 char *id_path_tag,
+                                 char another_tag)
+{
+   struct udev_device *device;
+   struct udev_enumerate *e;
+   struct udev_list_entry *entry;
+   const char *path, *id_path_tag_tmp;
+   char *path_res;
+   char found = 0;
+
+   e = udev_enumerate_new(udev);
+   udev_enumerate_add_match_subsystem(e, "drm");
+   udev_enumerate_add_match_sysname(e, "render*");
+
+   udev_enumerate_scan_devices(e);
+   udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
+      path = udev_list_entry_get_name(entry);
+      device = udev_device_new_from_syspath(udev, path);
+      if (!device)
+         continue;
+      id_path_tag_tmp = udev_device_get_property_value(device, "ID_PATH_TAG");
+      if (id_path_tag_tmp) {
+         if ((!another_tag && !strcmp(id_path_tag, id_path_tag_tmp)) ||
+             (another_tag && strcmp(id_path_tag, id_path_tag_tmp))) {
+            found = 1;
+            break;
+         }
+      }
+      udev_device_unref(device);
+   }
+
+   if (found) {
+      path_res = strdup(udev_device_get_devnode(device));
+      udev_device_unref(device);
+      return path_res;
+   }
+   return NULL;
+}
+
+static char *
+get_id_path_tag_from_fd(struct udev *udev, int fd)
+{
+   struct udev_device *device;
+   struct stat buf;
+   const char *id_path_tag_tmp;
+
+   if (fstat(fd, &buf) < 0) {
+      return NULL;
+   }
+
+   device = udev_device_new_from_devnum(udev, 'c', buf.st_rdev);
+   if (!device)
+      return NULL;
+
+   id_path_tag_tmp = udev_device_get_property_value(device, "ID_PATH_TAG");
+   if (!id_path_tag_tmp)
+      return NULL;
+
+   return strdup(id_path_tag_tmp);
+}
+#endif
+
 static const struct glx_context_vtable dri3_context_vtable;
 
 static inline void
@@ -564,6 +631,22 @@ dri3_fake_front_buffer(struct dri3_drawable *priv)
    return priv->buffers[DRI3_FRONT_ID];
 }
 
+static void dri3_linear_buffer_update(struct dri3_screen *psc,
+                                      struct dri3_buffer *buff)
+{
+   struct glx_context *gc = __glXGetCurrentContext();
+   struct dri3_context *pcp = (struct dri3_context *) gc;
+
+   if (buff->linear_buffer && pcp->driContext)
+      psc->image->blitImage(pcp->driContext,
+                            buff->linear_buffer,
+                            buff->image,
+                            0, 0, buff->width,
+                            buff->height,
+                            0, 0, buff->width,
+                            buff->height);
+}
+
 static void
 dri3_copy_area (xcb_connection_t *c  /**< */,
                 xcb_drawable_t    src_drawable  /**< */,
@@ -596,6 +679,8 @@ dri3_copy_sub_buffer(__GLXDRIdrawable *pdraw, int x, int y,
                      int width, int height,
                      Bool flush)
 {
+   struct glx_context *gc = __glXGetCurrentContext();
+   struct dri3_context *pcp = (struct dri3_context *) gc;
    struct dri3_drawable *priv = (struct dri3_drawable *) pdraw;
    struct dri3_screen *psc = (struct dri3_screen *) pdraw->psc;
    xcb_connection_t     *c = XGetXCBConnection(priv->base.psc->dpy);
@@ -614,6 +699,7 @@ dri3_copy_sub_buffer(__GLXDRIdrawable *pdraw, int x, int y,
 
    y = priv->height - y - height;
 
+   dri3_linear_buffer_update(psc, back);
    dri3_fence_reset(c, back);
    dri3_copy_area(c,
                   dri3_back_buffer(priv)->pixmap,
@@ -625,14 +711,22 @@ dri3_copy_sub_buffer(__GLXDRIdrawable *pdraw, int x, int y,
     * front.
     */
    if (priv->have_fake_front) {
-      dri3_fence_reset(c, dri3_fake_front_buffer(priv));
-      dri3_copy_area(c,
-                     dri3_back_buffer(priv)->pixmap,
-                     dri3_fake_front_buffer(priv)->pixmap,
-                     dri3_drawable_gc(priv),
-                     x, y, x, y, width, height);
-      dri3_fence_trigger(c, dri3_fake_front_buffer(priv));
-      dri3_fence_await(c, dri3_fake_front_buffer(priv));
+      if (!psc->is_different_gpu) {
+         dri3_fence_reset(c, dri3_fake_front_buffer(priv));
+         dri3_copy_area(c,
+                        dri3_back_buffer(priv)->pixmap,
+                        dri3_fake_front_buffer(priv)->pixmap,
+                        dri3_drawable_gc(priv),
+                        x, y, x, y, width, height);
+         dri3_fence_trigger(c, dri3_fake_front_buffer(priv));
+         dri3_fence_await(c, dri3_fake_front_buffer(priv));
+      } else if (pcp->driContext) {
+         psc->image->blitImage(pcp->driContext,
+                               dri3_fake_front_buffer(priv)->image,
+                               dri3_back_buffer(priv)->image,
+                               x, y, width, height,
+                               x, y, width, height);
+      }
    }
    dri3_fence_await(c, back);
 }
@@ -657,13 +751,25 @@ dri3_copy_drawable(struct dri3_drawable *priv, Drawable dest, Drawable src)
 static void
 dri3_wait_x(struct glx_context *gc)
 {
+   struct dri3_context *pcp = (struct dri3_context *) gc;
    struct dri3_drawable *priv = (struct dri3_drawable *)
       GetGLXDRIDrawable(gc->currentDpy, gc->currentDrawable);
+   struct dri3_screen *psc = (struct dri3_screen *) priv->base.psc;
+   struct dri3_buffer *front = dri3_fake_front_buffer(priv);
 
    if (priv == NULL || !priv->have_fake_front)
       return;
 
-   dri3_copy_drawable(priv, dri3_fake_front_buffer(priv)->pixmap, priv->base.xDrawable);
+   dri3_copy_drawable(priv, front->pixmap, priv->base.xDrawable);
+
+   if (front->linear_buffer && pcp->driContext)
+      psc->image->blitImage(pcp->driContext,
+                            front->image,
+                            front->linear_buffer,
+                            0, 0, front->width,
+                            front->height,
+                            0, 0, front->width,
+                            front->height);
 }
 
 static void
@@ -675,6 +781,8 @@ dri3_wait_gl(struct glx_context *gc)
    if (priv == NULL || !priv->have_fake_front)
       return;
 
+   dri3_linear_buffer_update((struct dri3_screen *)priv->base.psc,
+dri3_fake_front_buffer(priv));
    dri3_copy_drawable(priv, priv->base.xDrawable, dri3_fake_front_buffer(priv)->pixmap);
 }
 
@@ -743,6 +851,7 @@ dri3_alloc_render_buffer(struct glx_screen *glx_screen, Drawable draw,
    struct dri3_screen *psc = (struct dri3_screen *) glx_screen;
    Display *dpy = glx_screen->dpy;
    struct dri3_buffer *buffer;
+   __DRIimage *shared_buffer;
    xcb_connection_t *c = XGetXCBConnection(dpy);
    xcb_pixmap_t pixmap;
    xcb_sync_fence_t sync_fence;
@@ -771,24 +880,48 @@ dri3_alloc_render_buffer(struct glx_screen *glx_screen, Drawable draw,
    if (!buffer->cpp)
       goto no_image;
 
-   buffer->image = (*psc->image->createImage) (psc->driScreen,
-                                               width, height,
-                                               format,
-                                               __DRI_IMAGE_USE_SHARE|__DRI_IMAGE_USE_SCANOUT,
-                                               buffer);
+   if (!psc->is_different_gpu) {
+      buffer->image = (*psc->image->createImage) (psc->driScreen,
+                                                  width, height,
+                                                  format,
+                                                  __DRI_IMAGE_USE_SHARE |
+                                                  __DRI_IMAGE_USE_SCANOUT,
+                                                  buffer);
+      shared_buffer = buffer->image;
 
+      if (!buffer->image)
+         goto no_image;
+   } else {
+      buffer->image = (*psc->image->createImage) (psc->driScreen,
+                                                  width, height,
+                                                  format,
+                                                  0,
+                                                  buffer);
 
-   if (!buffer->image)
-      goto no_image;
+      if (!buffer->image)
+         goto no_image;
+
+      buffer->linear_buffer = (*psc->image->createImage) (psc->driScreen,
+                                                          width, height,
+                                                          format,
+                                                          __DRI_IMAGE_USE_SHARE |
+                                                          __DRI_IMAGE_USE_SCANOUT |
+                                                          __DRI_IMAGE_USE_LINEAR,
+                                                          buffer);
+      shared_buffer = buffer->linear_buffer;
+
+      if (!buffer->linear_buffer)
+         goto no_linear_buffer;
+   }
 
    /* X wants the stride, so ask the image for it
     */
-   if (!(*psc->image->queryImage)(buffer->image, __DRI_IMAGE_ATTRIB_STRIDE, &stride))
+   if (!(*psc->image->queryImage)(shared_buffer, __DRI_IMAGE_ATTRIB_STRIDE, &stride))
       goto no_buffer_attrib;
 
    buffer->pitch = stride;
 
-   if (!(*psc->image->queryImage)(buffer->image, __DRI_IMAGE_ATTRIB_FD, &buffer_fd))
+   if (!(*psc->image->queryImage)(shared_buffer, __DRI_IMAGE_ATTRIB_FD, &buffer_fd))
       goto no_buffer_attrib;
 
    xcb_dri3_pixmap_from_buffer(c,
@@ -819,7 +952,10 @@ dri3_alloc_render_buffer(struct glx_screen *glx_screen, Drawable draw,
    return buffer;
 
 no_buffer_attrib:
-   (*psc->image->destroyImage)(buffer->image);
+   (*psc->image->destroyImage)(shared_buffer);
+no_linear_buffer:
+   if (psc->is_different_gpu)
+      (*psc->image->destroyImage)(buffer->image);
 no_image:
    free(buffer);
 no_buffer:
@@ -845,6 +981,8 @@ dri3_free_render_buffer(struct dri3_drawable *pdraw, struct dri3_buffer *buffer)
    xcb_sync_destroy_fence(c, buffer->sync_fence);
    xshmfence_unmap_shm(buffer->shm_fence);
    (*psc->image->destroyImage)(buffer->image);
+   if (buffer->linear_buffer)
+      (*psc->image->destroyImage)(buffer->linear_buffer);
    free(buffer);
 }
 
@@ -1120,7 +1258,10 @@ dri3_get_buffer(__DRIdrawable *driDrawable,
                 enum dri3_buffer_type buffer_type,
                 void *loaderPrivate)
 {
+   struct glx_context *gc = __glXGetCurrentContext();
+   struct dri3_context *pcp = (struct dri3_context *) gc;
    struct dri3_drawable *priv = loaderPrivate;
+   struct dri3_screen *psc = (struct dri3_screen *) priv->base.psc;
    xcb_connection_t     *c = XGetXCBConnection(priv->base.psc->dpy);
    struct dri3_buffer      *buffer;
    int                  buf_id;
@@ -1159,14 +1300,24 @@ dri3_get_buffer(__DRIdrawable *driDrawable,
       switch (buffer_type) {
       case dri3_buffer_back:
          if (buffer) {
-            dri3_fence_reset(c, new_buffer);
-            dri3_fence_await(c, buffer);
-            dri3_copy_area(c,
-                           buffer->pixmap,
-                           new_buffer->pixmap,
-                           dri3_drawable_gc(priv),
-                           0, 0, 0, 0, priv->width, priv->height);
+            if (!buffer->linear_buffer) {
+               dri3_fence_reset(c, new_buffer);
+               dri3_fence_await(c, buffer);
+               dri3_copy_area(c,
+                              buffer->pixmap,
+                              new_buffer->pixmap,
+                              dri3_drawable_gc(priv),
+                              0, 0, 0, 0, priv->width, priv->height);
             dri3_fence_trigger(c, new_buffer);
+            } else if (pcp->driContext) {
+               psc->image->blitImage(pcp->driContext,
+                                     new_buffer->image,
+                                     buffer->image,
+                                     0, 0, priv->width,
+                                     priv->height,
+                                     0, 0, priv->width,
+                                     priv->height);
+            }
             dri3_free_render_buffer(priv, buffer);
          }
          break;
@@ -1178,6 +1329,15 @@ dri3_get_buffer(__DRIdrawable *driDrawable,
                         dri3_drawable_gc(priv),
                         0, 0, 0, 0, priv->width, priv->height);
          dri3_fence_trigger(c, new_buffer);
+         if (new_buffer->linear_buffer && pcp->driContext) {
+            psc->image->blitImage(pcp->driContext,
+                                  new_buffer->image,
+                                  new_buffer->linear_buffer,
+                                  0, 0, priv->width,
+                                  priv->height,
+                                  0, 0, priv->width,
+                                  priv->height);
+         }
          break;
       }
       buffer = new_buffer;
@@ -1240,6 +1400,7 @@ dri3_get_buffers(__DRIdrawable *driDrawable,
                  struct __DRIimageList *buffers)
 {
    struct dri3_drawable *priv = loaderPrivate;
+   struct dri3_screen *psc = (struct dri3_screen *) priv->base.psc;
    struct dri3_buffer   *front, *back;
 
    buffers->image_mask = 0;
@@ -1257,7 +1418,7 @@ dri3_get_buffers(__DRIdrawable *driDrawable,
       buffer_mask |= __DRI_IMAGE_BUFFER_FRONT;
 
    if (buffer_mask & __DRI_IMAGE_BUFFER_FRONT) {
-      if (priv->is_pixmap)
+      if (priv->is_pixmap && !psc->is_different_gpu)
          front = dri3_get_pixmap_buffer(driDrawable,
                                         format,
                                         dri3_buffer_front,
@@ -1291,7 +1452,7 @@ dri3_get_buffers(__DRIdrawable *driDrawable,
    if (front) {
       buffers->image_mask |= __DRI_IMAGE_BUFFER_FRONT;
       buffers->front = front->image;
-      priv->have_fake_front = !priv->is_pixmap;
+      priv->have_fake_front = psc->is_different_gpu || !priv->is_pixmap;
    }
 
    if (back) {
@@ -1345,6 +1506,7 @@ dri3_swap_buffers(__GLXDRIdrawable *pdraw, int64_t target_msc, int64_t divisor,
       if (target_msc == 0)
          target_msc = priv->msc + priv->swap_interval * (priv->send_sbc - priv->recv_sbc);
 
+      dri3_linear_buffer_update(psc, priv->buffers[buf_id]);
       priv->buffers[buf_id]->busy = 1;
       xcb_present_pixmap(c,
                          priv->base.xDrawable,
@@ -1369,6 +1531,7 @@ dri3_swap_buffers(__GLXDRIdrawable *pdraw, int64_t target_msc, int64_t divisor,
        * the X server is done copying the bits
        */
       if (priv->have_fake_front) {
+         dri3_linear_buffer_update(psc, priv->buffers[DRI3_FRONT_ID]);
          dri3_fence_reset(c, priv->buffers[DRI3_FRONT_ID]);
          dri3_copy_area(c,
                         priv->buffers[buf_id]->pixmap,
@@ -1565,7 +1728,8 @@ dri3_bind_extensions(struct dri3_screen *psc, struct glx_display * priv,
                                  "GLX_EXT_create_context_es2_profile");
 
    for (i = 0; extensions[i]; i++) {
-      if ((strcmp(extensions[i]->name, __DRI_TEX_BUFFER) == 0)) {
+      if (!psc->is_different_gpu && (strcmp(extensions[i]->name, __DRI_TEX_BUFFER)
+== 0)) {
          psc->texBuffer = (__DRItexBufferExtension *) extensions[i];
          __glXEnableDirectExtension(&psc->base, "GLX_EXT_texture_from_pixmap");
       }
@@ -1588,6 +1752,22 @@ static const struct glx_screen_vtable dri3_screen_vtable = {
    dri3_create_context,
    dri3_create_context_attribs
 };
+
+static int
+drm_open_device(const char *device_name)
+{
+   int fd;
+#ifdef O_CLOEXEC
+   fd = open(device_name, O_RDWR | O_CLOEXEC);
+   if (fd == -1 && errno == EINVAL)
+#endif
+   {
+      fd = open(device_name, O_RDWR);
+      if (fd != -1)
+         fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+   }
+   return fd;
+}
 
 /** dri3_create_screen
  *
@@ -1613,7 +1793,12 @@ dri3_create_screen(int screen, struct glx_display * priv)
    __GLXDRIscreen *psp;
    struct glx_config *configs = NULL, *visuals = NULL;
    char *driverName, *deviceName;
+   const char *dri_prime = getenv("DRI_PRIME");
+   char *prime = NULL;
    int i;
+
+   if (dri_prime)
+      prime = strdup(dri_prime);
 
    psc = calloc(1, sizeof *psc);
    if (psc == NULL)
@@ -1638,6 +1823,51 @@ dri3_create_screen(int screen, struct glx_display * priv)
          ErrorMessageF("Connection closed during DRI3 initialization failure");
 
       return NULL;
+   }
+
+   if (prime != NULL) {
+#ifdef HAVE_LIBUDEV
+      struct udev* udev = udev_new();
+      int is_different_device;
+      char *device_id_path_tag;
+      char another_tag = 0;
+      char *prime_device_name = NULL;
+      int fd;
+
+      if (!udev)
+         goto prime_clean;
+      device_id_path_tag = get_id_path_tag_from_fd(udev, psc->fd);
+      if (!device_id_path_tag)
+         goto udev_clean;
+
+      is_different_device = 1;
+      /* two format are supported:
+       * "1": choose any other card than the card used by the compositor.
+       * id_path_tag: (for example "pci-0000_02_00_0") choose the card
+       * with this id_path_tag. */
+      if (!strcmp(prime,"1")) {
+         free(prime);
+         prime = strdup(device_id_path_tag);
+         /* request a card with a different card than the compositor card */
+         another_tag = 1;
+      } else if (!strcmp(device_id_path_tag, prime))
+         /* we are to get the render-node of the compositor card */
+         is_different_device = 0;
+
+      prime_device_name = get_render_node_from_id_path_tag(udev, prime,
+                                                           another_tag);
+      fd = drm_open_device(prime_device_name);
+      if (fd > 0) {
+         close(psc->fd);
+         psc->fd = fd;
+         psc->is_different_gpu = is_different_device;
+      }
+      free(device_id_path_tag);
+    udev_clean:
+      udev_unref(udev);
+    prime_clean:
+#endif
+      free(prime);
    }
    deviceName = NULL;
 
@@ -1706,8 +1936,12 @@ dri3_create_screen(int screen, struct glx_display * priv)
       goto handle_error;
    }
 
-   if (!psc->texBuffer || psc->texBuffer->base.version < 2 ||
-       !psc->texBuffer->setTexBuffer2)
+   if (psc->is_different_gpu && psc->image->base.version < 9) {
+      ErrorMessageF("Different GPU, but image extension version 9 or later not found\n");
+      goto handle_error;
+   }
+   if (!psc->is_different_gpu && (!psc->texBuffer || psc->texBuffer->base.version < 2 ||
+       !psc->texBuffer->setTexBuffer2))
    {
       ErrorMessageF("Version 2 or later of texBuffer extension not found\n");
       goto handle_error;

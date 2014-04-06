@@ -97,12 +97,17 @@ libglx_la_SOURCES = \
 	  dri2_query_renderer.c \
 	  applegl_glx.c
 
+libglx_la_LIBADD = $(top_builddir)/src/loader/libloader.la
+
 if HAVE_DRI3
 libglx_la_SOURCES += \
           dri3_glx.c
+
+AM_CFLAGS += $(LIBUDEV_CFLAGS)
+libglx_la_LIBADD += $(LIBUDEV_LIBS)
 endif
 
-libglx_la_LIBADD = $(top_builddir)/src/loader/libloader.la
+
 
 GL_LIBS = \
 	libglx.la \
