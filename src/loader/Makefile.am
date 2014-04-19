@@ -29,6 +29,23 @@ libloader_la_CPPFLAGS = \
 	$(VISIBILITY_CFLAGS) \
 	$(LIBUDEV_CFLAGS)
 
+libloader_la_SOURCES = $(LOADER_C_FILES)
+libloader_la_LIBADD = $()
+
+if NEED_OPENGL_COMMON
+libloader_la_CPPFLAGS += \
+	-I$(top_srcdir)/src/mesa/drivers/dri/common/ \
+	-I$(top_srcdir)/src/mesa/ \
+	-I$(top_srcdir)/src/mapi/ \
+	-DUSE_DRICONF
+
+libloader_la_SOURCES += \
+	$(top_srcdir)/src/mesa/drivers/dri/common/xmlconfig.c
+
+libloader_la_LIBADD += \
+	-lexpat
+endif
+
 if !HAVE_LIBDRM
 libloader_la_CPPFLAGS += \
 	-D__NOT_HAVE_DRM_H
@@ -36,8 +53,6 @@ else
 libloader_la_CPPFLAGS += \
 	$(LIBDRM_CFLAGS)
 
-libloader_la_LIBADD = \
+libloader_la_LIBADD += \
 	$(LIBDRM_LIBS)
 endif
-
-libloader_la_SOURCES = $(LOADER_C_FILES)
