@@ -77,73 +77,6 @@
 #include "dri3_priv.h"
 #include "loader.h"
 
-#ifdef HAVE_LIBUDEV
-#include <libudev.h>
-
-static char *
-get_render_node_from_id_path_tag(struct udev *udev,
-                                 char *id_path_tag,
-                                 char another_tag)
-{
-   struct udev_device *device;
-   struct udev_enumerate *e;
-   struct udev_list_entry *entry;
-   const char *path, *id_path_tag_tmp;
-   char *path_res;
-   char found = 0;
-
-   e = udev_enumerate_new(udev);
-   udev_enumerate_add_match_subsystem(e, "drm");
-   udev_enumerate_add_match_sysname(e, "render*");
-
-   udev_enumerate_scan_devices(e);
-   udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
-      path = udev_list_entry_get_name(entry);
-      device = udev_device_new_from_syspath(udev, path);
-      if (!device)
-         continue;
-      id_path_tag_tmp = udev_device_get_property_value(device, "ID_PATH_TAG");
-      if (id_path_tag_tmp) {
-         if ((!another_tag && !strcmp(id_path_tag, id_path_tag_tmp)) ||
-             (another_tag && strcmp(id_path_tag, id_path_tag_tmp))) {
-            found = 1;
-            break;
-         }
-      }
-      udev_device_unref(device);
-   }
-
-   if (found) {
-      path_res = strdup(udev_device_get_devnode(device));
-      udev_device_unref(device);
-      return path_res;
-   }
-   return NULL;
-}
-
-static char *
-get_id_path_tag_from_fd(struct udev *udev, int fd)
-{
-   struct udev_device *device;
-   struct stat buf;
-   const char *id_path_tag_tmp;
-
-   if (fstat(fd, &buf) < 0) {
-      return NULL;
-   }
-
-   device = udev_device_new_from_devnum(udev, 'c', buf.st_rdev);
-   if (!device)
-      return NULL;
-
-   id_path_tag_tmp = udev_device_get_property_value(device, "ID_PATH_TAG");
-   if (!id_path_tag_tmp)
-      return NULL;
-
-   return strdup(id_path_tag_tmp);
-}
-#endif
-
 static const struct glx_context_vtable dri3_context_vtable;
 
 static inline void
@@ -1820,22 +1753,6 @@ static const struct glx_screen_vtable dri3_screen_vtable = {
    dri3_create_context_attribs
 };
 
-static int
-drm_open_device(const char *device_name)
-{
-   int fd;
-#ifdef O_CLOEXEC
-   fd = open(device_name, O_RDWR | O_CLOEXEC);
-   if (fd == -1 && errno == EINVAL)
-#endif
-   {
-      fd = open(device_name, O_RDWR);
-      if (fd != -1)
-         fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-   }
-   return fd;
-}
-
 /** dri3_create_screen
  *
  * Initialize DRI3 on the specified screen.
@@ -1860,12 +1777,7 @@ dri3_create_screen(int screen, struct glx_display * priv)
    __GLXDRIscreen *psp;
    struct glx_config *configs = NULL, *visuals = NULL;
    char *driverName, *deviceName;
-   const char *dri_prime = getenv("DRI_PRIME");
-   char *prime = NULL;
    int i;
-
-   if (dri_prime)
-      prime = strdup(dri_prime);
 
    psc = calloc(1, sizeof *psc);
    if (psc == NULL)
@@ -1892,50 +1804,7 @@ dri3_create_screen(int screen, struct glx_display * priv)
       return NULL;
    }
 
-   if (prime != NULL) {
-#ifdef HAVE_LIBUDEV
-      struct udev* udev = udev_new();
-      int is_different_device;
-      char *device_id_path_tag;
-      char another_tag = 0;
-      char *prime_device_name = NULL;
-      int fd;
-
-      if (!udev)
-         goto prime_clean;
-      device_id_path_tag = get_id_path_tag_from_fd(udev, psc->fd);
-      if (!device_id_path_tag)
-         goto udev_clean;
-
-      is_different_device = 1;
-      /* two format are supported:
-       * "1": choose any other card than the card used by the server.
-       * id_path_tag: (for example "pci-0000_02_00_0") choose the card
-       * with this id_path_tag. */
-      if (!strcmp(prime,"1")) {
-         free(prime);
-         prime = strdup(device_id_path_tag);
-         /* request a card with a different card than the server card */
-         another_tag = 1;
-      } else if (!strcmp(device_id_path_tag, prime))
-         /* we are to get the render-node of the server card */
-         is_different_device = 0;
-
-      prime_device_name = get_render_node_from_id_path_tag(udev, prime,
-                                                           another_tag);
-      fd = drm_open_device(prime_device_name);
-      if (fd > 0) {
-         close(psc->fd);
-         psc->fd = fd;
-         psc->is_different_gpu = is_different_device;
-      }
-      free(device_id_path_tag);
-    udev_clean:
-      udev_unref(udev);
-    prime_clean:
-#endif
-      free(prime);
-   }
+   psc->fd = loader_get_user_preferred_fd(psc->fd, &psc->is_different_gpu);
    deviceName = NULL;
 
    driverName = loader_get_driver_for_fd(psc->fd, 0);

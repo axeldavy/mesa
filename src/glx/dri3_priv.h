@@ -135,7 +135,7 @@ struct dri3_screen {
 
    void *driver;
    int fd;
-   Bool is_different_gpu;
+   int is_different_gpu;
 
    Bool show_fps;
 };
