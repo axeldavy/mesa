@@ -191,6 +191,8 @@ struct dri2_egl_display
    int			     authenticated;
    int			     formats;
    uint32_t                  capabilities;
+   int			     is_different_gpu;
+   int			     blit_front;
 #endif
 };
 
@@ -243,7 +245,8 @@ struct dri2_egl_surface
    struct {
 #ifdef HAVE_WAYLAND_PLATFORM
       struct wl_buffer   *wl_buffer;
-      __DRIimage         *dri_image;
+      __DRIimage         *rendering_image;
+      __DRIimage         *shared_image;
 #endif
 #ifdef HAVE_DRM_PLATFORM
       struct gbm_bo       *bo;
