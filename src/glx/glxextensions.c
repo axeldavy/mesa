@@ -566,9 +566,14 @@ __glXCalculateUsableExtensions(struct glx_screen * psc,
                                GLboolean display_is_direct_capable,
                                int minor_version)
 {
+   const char *ignore_server_restrictions = getenv("IGNORE_SERVER");
+   unsigned char should_ignore_server_restrictions = 0;
    unsigned char server_support[8];
    unsigned char usable[8];
    unsigned i;
+
+   if (ignore_server_restrictions && !strcmp(ignore_server_restrictions,"1"))
+      should_ignore_server_restrictions = 0xff;
 
    __glXExtensionsCtr();
    __glXExtensionsCtrScreen(psc);
@@ -617,7 +622,9 @@ __glXCalculateUsableExtensions(struct glx_screen * psc,
             | (client_glx_support[i] & psc->direct_support[i] &
                server_support[i])
             | (client_glx_support[i] & psc->direct_support[i] &
-               direct_glx_only[i]);
+               direct_glx_only[i])
+            | (client_glx_support[i] & psc->direct_support[i] &
+               should_ignore_server_restrictions);
       }
    }
    else {
