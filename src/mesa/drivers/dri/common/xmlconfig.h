@@ -30,6 +30,8 @@
 #ifndef __XMLCONFIG_H
 #define __XMLCONFIG_H
 
+#include <GL/gl.h>
+
 #define STRING_CONF_MAXLEN 25
 
 /** \brief Option data types */
